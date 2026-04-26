@@ -32,9 +32,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--response_mat",
         default="rowData/CAVEdata/response coefficient.mat",
-        help="Path to response coefficient .mat containing C",
+        help="Path to response coefficient .mat containing C (and optionally R)",
     )
     parser.add_argument("--gpu_ids", default="0", help="CUDA visible devices value, e.g. 0 or 0,1")
+    parser.add_argument(
+        "--rgb_source",
+        default="provided",
+        choices=["provided", "synth"],
+        help="Use paired RGB MAT files (provided) or synthesize RGB from HSI using response R (synth)",
+    )
+    parser.add_argument(
+        "--psnr_range",
+        default="one",
+        choices=["one", "dtype2", "gtmax"],
+        help="PSNR data range: one=1.0, dtype2=2.0 (legacy float behavior), gtmax=max(gt)-min(gt)",
+    )
     parser.add_argument("--recursive", action="store_true", help="Recursively search for .mat files")
     parser.add_argument(
         "--normalize_255",
@@ -66,21 +78,35 @@ def resolve_checkpoint(weights_path: str, tf_mod) -> str:
     raise FileNotFoundError(f"Checkpoint not found for weights_path: {weights_path}")
 
 
-def load_response_c(response_mat: str) -> np.ndarray:
+def load_response_c_and_r(response_mat: str) -> Tuple[np.ndarray, np.ndarray]:
     data = sio.loadmat(response_mat)
-    if "C" in data:
+    c = None
+    r = None
+    if "C" in data and isinstance(data["C"], np.ndarray):
         c = data["C"]
-        if c.shape != (32, 32):
-            raise ValueError(f"Expected C shape (32, 32), got {c.shape}")
-        return c.astype(np.float32)
+    if "R" in data and isinstance(data["R"], np.ndarray):
+        r = data["R"]
 
-    for key, value in data.items():
-        if key.startswith("__"):
-            continue
-        if isinstance(value, np.ndarray) and value.shape == (32, 32):
-            return value.astype(np.float32)
+    if c is None:
+        for key, value in data.items():
+            if key.startswith("__"):
+                continue
+            if isinstance(value, np.ndarray) and value.shape == (32, 32):
+                c = value
+                break
 
-    raise KeyError(f"Could not find 32x32 C in {response_mat}")
+    if c is None or c.shape != (32, 32):
+        raise KeyError(f"Could not find 32x32 C in {response_mat}")
+
+    if r is not None:
+        if r.shape == (31, 3):
+            pass
+        elif r.shape == (3, 31):
+            r = r.T
+        else:
+            r = None
+
+    return c.astype(np.float32), (None if r is None else r.astype(np.float32))
 
 
 def list_mat_files(folder: str, recursive: bool) -> List[str]:
@@ -130,11 +156,17 @@ def build_z_from_x(x_hsi: np.ndarray, c: np.ndarray, ratio: int = CAVE_RATIO) ->
     return z
 
 
-def psnr(gt: np.ndarray, pred: np.ndarray) -> float:
+def psnr(gt: np.ndarray, pred: np.ndarray, psnr_range: str = "one") -> float:
     mse = np.mean((gt - pred) ** 2)
     if mse <= 1e-12:
         return 99.0
-    return float(10.0 * np.log10(1.0 / mse))
+    if psnr_range == "dtype2":
+        peak = 2.0
+    elif psnr_range == "gtmax":
+        peak = max(float(np.max(gt) - np.min(gt)), 1e-12)
+    else:
+        peak = 1.0
+    return float(10.0 * np.log10((peak * peak) / mse))
 
 
 def sam_deg(gt: np.ndarray, pred: np.ndarray) -> float:
@@ -189,7 +221,7 @@ def main() -> None:
     import MHFnet  # pylint: disable=import-error,import-outside-toplevel
 
     ckpt = resolve_checkpoint(args.weights_path, tf)
-    c = load_response_c(args.response_mat)
+    c, r = load_response_c_and_r(args.response_mat)
 
     hsi_files = list_mat_files(args.test_hsi_dir, args.recursive)
     if not hsi_files:
@@ -220,12 +252,20 @@ def main() -> None:
         for hsi_path in hsi_files:
             name = os.path.basename(hsi_path)
             rgb_path = os.path.join(args.test_rgb_dir, name)
-            if not os.path.exists(rgb_path):
+            if args.rgb_source == "provided" and not os.path.exists(rgb_path):
                 print(f"[Skip] RGB pair not found for {name}")
                 continue
 
             x_hsi, hsi_key = load_candidate_cube(hsi_path, prefer_rgb=False)
-            y_rgb, rgb_key = load_candidate_cube(rgb_path, prefer_rgb=True)
+            if args.rgb_source == "provided":
+                y_rgb, rgb_key = load_candidate_cube(rgb_path, prefer_rgb=True)
+            else:
+                if r is None:
+                    raise ValueError(
+                        "rgb_source=synth requires response_mat to contain R with shape (31,3) or (3,31)"
+                    )
+                y_rgb = np.tensordot(x_hsi, r, axes=(2, 0)).astype(np.float32)
+                rgb_key = "SYNTH_FROM_R"
 
             if x_hsi.shape[2] != OUT_DIM:
                 raise ValueError(
@@ -241,6 +281,12 @@ def main() -> None:
             x_hsi = auto_normalize(x_hsi, args.normalize_255)
             y_rgb = auto_normalize(y_rgb, args.normalize_255)
 
+            if args.rgb_source == "provided" and r is not None:
+                y_syn = np.tensordot(x_hsi, r, axes=(2, 0)).astype(np.float32)
+                y_syn = auto_normalize(y_syn, args.normalize_255)
+                rgb_gap_rmse = float(np.sqrt(np.mean((y_rgb - y_syn) ** 2)))
+                print(f"[Info] {name} | provided-vs-synth RGB RMSE={rgb_gap_rmse:.6f}")
+
             z_msi = build_z_from_x(x_hsi, c, CAVE_RATIO)
 
             pred_x, pred_ya, pred_hy = sess.run(
@@ -255,7 +301,7 @@ def main() -> None:
             pred_ya = np.squeeze(pred_ya, axis=0)
             pred_hy = np.squeeze(pred_hy, axis=0)
 
-            scene_psnr = psnr(x_hsi, pred_x)
+            scene_psnr = psnr(x_hsi, pred_x, args.psnr_range)
             scene_sam = sam_deg(x_hsi, pred_x)
             scene_rmse = rmse(x_hsi, pred_x)
             scene_ergas = ergas(x_hsi, pred_x, CAVE_RATIO)
