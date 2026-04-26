@@ -173,8 +173,15 @@ def main() -> None:
 
     # Minimal shim for tf.contrib usage inside original model code.
     if not hasattr(tf, "contrib"):
+        def tf1_l2_regularizer(scale: float):
+            # Match TF1 contrib behavior and support ref variables.
+            def _regularizer(var):
+                return tf.multiply(scale, tf.nn.l2_loss(var))
+
+            return _regularizer
+
         tf.contrib = types.SimpleNamespace(
-            layers=types.SimpleNamespace(l2_regularizer=lambda scale: tf.keras.regularizers.l2(scale))
+            layers=types.SimpleNamespace(l2_regularizer=tf1_l2_regularizer)
         )
 
     # Make local imports in this legacy codebase see tf.compat.v1 as tensorflow.
